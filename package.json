@@ -1,0 +1,52 @@
+{
+  "name": "grade-tracker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cross-platform grade tracking starter for Windows and Android",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "desktop:dev": "concurrently -k \"vite\" \"wait-on http://localhost:5173 && electron .\"",
+    "desktop:build": "vite build && electron-builder --win nsis",
+    "android:init": "cap add android",
+    "android:sync": "vite build && cap sync android",
+    "android:open": "cap open android",
+    "android:build": "vite build && cap sync android && cd android && gradlew.bat assembleDebug"
+  },
+  "dependencies": {
+    "@capacitor/android": "^7.4.3",
+    "@capacitor/core": "^7.4.3",
+    "@supabase/supabase-js": "^2.58.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.4.3",
+    "concurrently": "^9.2.1",
+    "electron": "^38.3.0",
+    "electron-builder": "^26.0.12",
+    "vite": "^7.1.9",
+    "wait-on": "^9.0.1"
+  },
+  "build": {
+    "appId": "com.gradetracker.app",
+    "productName": "GradeTracker",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "GradeTracker-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}
