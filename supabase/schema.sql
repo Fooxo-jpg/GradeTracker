@@ -7,7 +7,7 @@ create table if not exists public.courses (
   grade numeric(5,2) not null default 0 check (grade between 0 and 100),
   final_grade numeric(4,2) check (final_grade between 1 and 5),
   grade_result text not null default '' check (grade_result in ('', 'P', 'F')),
-  credits integer not null default 3 check (credits between 1 and 12),
+  credits integer not null default 3 check (credits between 0 and 12),
   considered boolean not null default true,
   course_type text not null default 'Core' check (course_type in ('Specialization', 'Core', 'Elective')),
   prerequisite_ids jsonb not null default '[]'::jsonb,

@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell } = require('electron');
+const { app, BrowserWindow, dialog, shell } = require('electron');
 const path = require('path');
 
 function createWindow() {
@@ -16,9 +16,16 @@ function createWindow() {
     }
   });
 
-  const devUrl = process.env.VITE_DEV_SERVER_URL || (!app.isPackaged ? 'http://localhost:5173' : null);
-  if (devUrl) win.loadURL(devUrl);
-  else win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  const devUrl = !app.isPackaged && (process.env.VITE_DEV_SERVER_URL || (process.argv.includes('--dev') ? 'http://127.0.0.1:5173' : null));
+  const loading = devUrl
+    ? win.loadURL(devUrl)
+    : win.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
+  loading.catch(error => {
+    console.error('Could not load GradeTracker:', error);
+    dialog.showErrorBox('GradeTracker could not start', devUrl
+      ? 'The development server could not be reached. Start the app with npm run desktop:dev.'
+      : 'The built app could not be loaded. Run npm run build, then launch Electron again.');
+  });
 
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);

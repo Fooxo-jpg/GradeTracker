@@ -4,5 +4,22 @@ release/
 android/.gradle/
 android/app/build/
 *.log
-.env
-.env.local
+.env*
+!.env.example
+
+# Local editors and package caches
+.idea/
+.vscode/
+.pnpm-store/
+.npm/
+.vite/
+
+# Test and build outputs
+coverage/
+*.tsbuildinfo
+android/build/
+android/.idea/
+android/local.properties
+android/captures/
+.DS_Store
+Thumbs.db

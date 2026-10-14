@@ -14,13 +14,21 @@ export const supabase = isSupabaseConfigured
     })
   : null;
 
+let sessionRequest = null;
 async function ensureSession() {
-  const { data: sessionData } = await supabase.auth.getSession();
-  if (sessionData.session) return sessionData.session.user;
-
-  const { data, error } = await supabase.auth.signInAnonymously();
-  if (error) throw error;
-  return data.user;
+  if (!sessionRequest) {
+    sessionRequest = (async () => {
+      const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      if (sessionData.session) return sessionData.session.user;
+      const { data, error } = await supabase.auth.signInAnonymously();
+      if (error) throw error;
+      return data.user;
+    })();
+  }
+  const pending = sessionRequest;
+  try { return await pending; }
+  finally { if (sessionRequest === pending) sessionRequest = null; }
 }
 
 export async function loadCourses() {
@@ -93,6 +101,7 @@ export async function saveProfile(profile) {
 
 export async function getAccount() {
   if (!supabase) return null;
+  await ensureSession();
   const { data, error } = await supabase.auth.getUser();
   if (error) throw error;
   return data.user;

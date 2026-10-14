@@ -1,7 +1,17 @@
-import './styles.css';
-import { createCourse, deleteCourse, deleteOwnAccount, deleteTerm, getAccount, isSupabaseConfigured, linkAnonymousEmail, loadCourses, loadProfile, loadTerms, saveProfile, signInWithPassword, signOutCurrentSession, updateCourse, upsertTerm } from './supabase.js';
-import { bindTermsPage, createDefaultTerms, ensureAutomaticTerms, renderTermsPage } from './terms.js';
-import { bindGradesPage, calculateCourseGrade, ensureGradebook, renderGradesPage } from './grades.js';
+import './styles/app.css';
+import { chooseBackupImportMode, mergeBackupData } from './features/backup-import.js';
+import { mergeCourseLists, preserveLocalWorkspace } from './services/course-sync.js';
+import { importCoreCourses } from './data/course-imports.js';
+import { courseTypeColor } from './data/course-colors.js';
+import { normalizeIcons } from './components/icons.js';
+import { closeActivePopups } from './components/popup-dismiss.js';
+import { styleColorPicker } from './components/color-picker.js';
+import { styleDatePicker } from './components/date-picker.js';
+import { styleTermDropdown } from './components/term-dropdown.js';
+import { appVersion, renderChangelog } from './features/changelog.js';
+import { createCourse, deleteCourse, deleteOwnAccount, deleteTerm, getAccount, isSupabaseConfigured, linkAnonymousEmail, loadCourses, loadProfile, loadTerms, saveProfile, signInWithPassword, signOutCurrentSession, updateCourse, upsertTerm } from './services/supabase.js';
+import { adjustAcademicStart, bindTermsPage, createDefaultTerms, ensureAutomaticTerms, getVisibleTerms, renderTermsPage, statusFor } from './features/terms.js';
+import { bindGradesPage, calculateCourseGrade, ensureGradebook, renderGradesPage } from './features/grades.js';
 
 const defaultCourses = [
   { id: 1, code: 'MATH 201', name: 'Calculus II', instructor: 'Prof. Santos', grade: 91, credits: 4, considered: true, courseType: 'Core', color: '#ff6b51', assessments: 8 },
@@ -160,8 +170,9 @@ function renderCoursesPage() {
   const selected = state.courses.find(course => String(course.id) === String(state.selectedCourseId)) || state.courses[0];
   if (selected && !state.selectedCourseId) state.selectedCourseId = selected.id;
   const term = selected ? state.terms.find(item => item.courseIds?.some(id => String(id) === String(selected.id))) : null;
-  const coursePassed = course => course.considered===false ? course.gradeResult==='P' : state.profile.scale_type === '5-highest' ? Number(course.finalGrade) >= 3 : Number(course.finalGrade) <= 3;
-  const completedUnits = state.courses.filter(coursePassed).reduce((sum, course) => sum + Number(course.credits || 0), 0);
+  const coursePassed = course => course.considered===false ? course.gradeResult==='P' : course.finalGrade != null && (state.profile.scale_type === '5-highest' ? Number(course.finalGrade) >= 3 : Number(course.finalGrade) <= 3);
+  const completedCourseIds = completedLockedCourseIds(state.terms);
+  const completedUnits = state.courses.filter(course => completedCourseIds.has(String(course.id)) && coursePassed(course)).reduce((sum, course) => sum + Number(course.credits || 0), 0);
   const selectedGwa = selected ? Number(selected.finalGrade ?? 0) : null;
   const goalDistance = selected?.considered===false ? 0 : selectedGwa==null ? 0 : Math.abs(selectedGwa - Number(state.profile.goal_gwa));
   const performance = selected ? selected.considered===false ? (selected.gradeResult==='P'?100:0) : selected.finalGrade==null ? 0 : (state.profile.scale_type === '5-highest' ? selectedGwa / 5 * 100 : (6 - selectedGwa) / 5 * 100) : 0;
@@ -173,13 +184,19 @@ function renderCoursesPage() {
   return `<section class="courses-page"><div class="course-browser"><div><h2>Course overview</h2><p>${state.courses.length} courses in your workspace</p></div><div class="course-browser-tools"><label class="course-search"><span>⌕</span><input id="course-search" type="search" placeholder="Search code, title, or instructor…"></label><select id="course-type-filter" aria-label="Filter courses by type"><option value="all">All course types</option><option>Core</option><option>Specialization</option><option>Elective</option></select></div></div><div class="course-workspace"><section><div class="course-list" id="course-list">${state.courses.map(course => { const assigned = state.terms.find(item => item.courseIds?.some(id => String(id) === String(course.id))); return `<article class="course-list-row ${String(selected?.id) === String(course.id) ? 'selected' : ''}" data-course-item data-search="${safe(`${course.code} ${course.name} ${course.instructor}`.toLowerCase())}" data-type="${safe(course.courseType)}" style="--accent:${course.color}"><i></i><button class="course-row-main" data-course-open="${course.id}"><span><strong>${safe(course.code)}</strong><em>${safe(course.name)}</em></span><small>${safe(course.instructor || 'Instructor not set')} · ${course.credits} units</small></button><span class="course-type">${safe(course.courseType)}</span><b>${assigned ? safe(assigned.name) : 'Unassigned'}</b><button class="course-row-edit" data-edit-course="${course.id}" aria-label="Edit ${safe(course.code)}" title="Edit course">✎</button></article>`; }).join('') || '<div class="empty-state">Add your first course.</div>'}</div><div class="course-no-results" id="course-no-results" hidden>No courses match your search.</div></section>${selected ? `<aside class="course-detail-panel"><div class="course-detail-head"><div><span>${safe(selected.courseType)}</span><h2>${safe(selected.code)}</h2><p>${safe(selected.name)}</p></div><span class="read-only-badge">View only</span></div><div class="course-info-grid"><div><span>Instructor</span><strong>${safe(selected.instructor || 'Not set')}</strong></div><div><span>Units</span><strong>${selected.credits}</strong></div><div><span>Term</span><strong>${term ? safe(term.name) : 'Unassigned'}</strong></div><div><span>GWA calculation</span><strong>${selected.considered ? 'Included' : 'Excluded'}</strong></div></div><div class="course-readonly-note"><span>${selected.considered ? '✓' : '—'}</span><p><strong>${selected.considered ? 'Included in Term GWA' : 'Excluded from Term GWA'}</strong><small>This setting can be changed from Edit course.</small></p></div><div class="course-relations-summary"><div><span>Prerequisites</span>${prerequisiteCourses.length ? prerequisiteCourses.map(course => `<b>${safe(course.code)} <small>${safe(course.name)}</small></b>`).join('') : '<em>None assigned</em>'}</div><div><span>Co-requisites</span>${corequisiteCourses.length ? corequisiteCourses.map(course => `<b>${safe(course.code)} <small>${safe(course.name)}</small></b>`).join('') : '<em>None assigned</em>'}</div></div><div class="course-insights"><div><span>Current grade</span><strong>${selected.grade}%</strong><small>${selectedGwa.toFixed(2)} GWA</small></div><div><span>Units earned</span><strong>${completedUnits}</strong><small>Passing courses</small></div><div><span>From target</span><strong>${goalDistance.toFixed(2)}</strong><small>Target ${Number(state.profile.goal_gwa).toFixed(2)}</small></div></div><div class="course-trend"><div><h3>Grade trend</h3><span>Recent performance</span></div><svg viewBox="0 0 100 40" preserveAspectRatio="none" aria-label="Grade trend"><polyline points="${points}"/></svg></div></aside>` : ''}</div></section>`;
 }
 
+function completedLockedCourseIds(terms) {
+  return new Set(terms.filter(term => term.completed && term.gradesLocked).flatMap(term => (term.courseIds || []).map(String)));
+}
+
 function render() {
+  state.courses.forEach(course => { course.color = courseTypeColor(course.courseType); });
+  closeActivePopups();
   applyPreferences();
   ensureAutomaticTerms(state);
   const today = new Date(); today.setHours(0, 0, 0, 0);
   const dashboardTerms = state.terms.filter(term => term.format === state.settings.termFormat);
-  const isCurrentTerm = term => term.startDate && term.endDate && !term.completed && today >= new Date(`${term.startDate}T00:00:00`) && today <= new Date(`${term.endDate}T00:00:00`);
-  const currentTerm = dashboardTerms.find(isCurrentTerm) || dashboardTerms.find(term => !term.completed && term.startDate && new Date(`${term.startDate}T00:00:00`) > today) || dashboardTerms.find(term => !term.completed) || null;
+  const datedTerms = [...dashboardTerms].sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999'));
+  const currentTerm = datedTerms.find(term => statusFor(term, today) === 'current') || datedTerms.find(term => statusFor(term, today) === 'upcoming') || dashboardTerms.find(term => statusFor(term, today) === 'setup') || null;
   const currentTermIds = new Set((currentTerm?.courseIds || []).map(String));
   const currentCourses = state.courses.filter(course => currentTermIds.has(String(course.id)));
   const dashboardGradePreview = course => {
@@ -196,7 +213,15 @@ function render() {
   const termWeekProgress = totalTermWeeks ? Math.round(currentTermWeek / totalTermWeeks * 100) : 0;
   const averageUnits = currentCourses.reduce((sum, course) => sum + Number(course.credits || 0), 0);
   const average = averageUnits ? Math.round(currentCourses.reduce((sum, course) => sum + Number(course.grade || 0) * Number(course.credits || 0), 0) / averageUnits) : 0;
-  const credits = state.courses.filter(course => course.considered !== false).reduce((sum, course) => sum + Number(course.credits || 0), 0);
+  const termResults = currentCourses.map(course => ({ course, result: calculateCourseGrade(course, state.settings, state.profile).finalResult ?? (course.considered === false ? course.gradeResult || null : course.finalGrade) }));
+  const gwaResults = termResults.filter(({ course, result }) => course.considered !== false && result != null && result !== '' && Number.isFinite(Number(result)));
+  const gwaUnits = gwaResults.reduce((sum, { course }) => sum + Number(course.credits || 0), 0);
+  const termGwa = gwaUnits ? gwaResults.reduce((sum, { course, result }) => sum + Number(result) * Number(course.credits || 0), 0) / gwaUnits : null;
+  const gradedCourseCount = termResults.filter(({ result }) => result != null && result !== '').length;
+  const targetGwa = Number(state.profile.goal_gwa) || 1.5;
+  const targetProgress = termGwa == null ? 0 : Math.max(0, Math.min(100, (state.profile.scale_type === '5-highest' ? termGwa / targetGwa : (6 - termGwa) / (6 - targetGwa)) * 100));
+  const completedCourseIds = completedLockedCourseIds(state.terms);
+  const credits = state.courses.filter(course => course.considered !== false && completedCourseIds.has(String(course.id))).reduce((sum, course) => sum + Number(course.credits || 0), 0);
   const requiredUnits = Math.max(1, Number(state.settings.requiredUnits) || 180);
   const pageDetails = {
     Courses: { eyebrow: 'COURSE MANAGEMENT', title: 'Your courses', copy: 'Organise subjects, credits, and assessments.', symbol: '◇', action: 'Add course' },
@@ -211,11 +236,11 @@ function render() {
       ${state.notice ? `<div class="settings-notice">${safe(state.notice)}</div>` : ''}
       <article class="settings-card"><div class="settings-heading"><span>◐</span><div><h2>Appearance</h2><p>Choose how GradeTracker looks and feels.</p></div></div><div class="settings-grid">
         <label>Theme<select id="setting-theme"><option value="light" ${state.settings.theme === 'light' ? 'selected' : ''}>Light</option><option value="dark" ${state.settings.theme === 'dark' ? 'selected' : ''}>Dark</option><option value="system" ${state.settings.theme === 'system' ? 'selected' : ''}>System</option></select></label>
-        <label>Accent colour<div class="color-setting"><input id="setting-accent" type="color" value="${safe(state.settings.accent)}"><span>${safe(state.settings.accent)}</span></div></label>
+        <label>Accent colour<div class="color-setting"><input id="setting-accent" type="color" aria-label="Choose accent colour" value="${safe(state.settings.accent)}"><span>${safe(state.settings.accent)}</span><small>Custom colour</small></div></label>
         <label>Layout density<select id="setting-density"><option value="comfortable" ${state.settings.density === 'comfortable' ? 'selected' : ''}>Comfortable</option><option value="compact" ${state.settings.density === 'compact' ? 'selected' : ''}>Compact</option></select></label>
         <label class="toggle-row">Sidebar open by default<input id="setting-sidebar" type="checkbox" ${state.settings.sidebarOpen ? 'checked' : ''}><i></i></label>
       </div></article>
-      <article class="settings-card"><div class="settings-heading"><span>▦</span><div><h2>Academic preferences</h2><p>Defaults for new academic records.</p></div></div><div class="settings-grid">
+      <article class="settings-card"><div class="settings-heading"><span class="calendar-heading-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M16 3v4M8 3v4M3 11h18M8 15h2m4 0h2M8 18h2"/></svg></span><div><h2>Academic preferences</h2><p>Defaults for new academic records.</p></div></div><div class="settings-grid">
         <label class="wide">Default curriculum<input type="text" readonly value="${safe(mapuaCurricula.find(([code]) => code === state.profile.curriculum)?.[1] || 'Set your curriculum in Profile')}"></label>
         <label>Goal GWA<input type="text" readonly value="${Number(state.profile.goal_gwa).toFixed(2)}"></label>
         <label>Required units<input id="setting-required-units" type="number" min="1" max="999" step="1" value="${requiredUnits}"></label>
@@ -224,8 +249,8 @@ function render() {
       </div></article>
       ${state.profile.scale_type === '1-highest' ? `<article class="settings-card grade-conversion-card"><div class="settings-heading"><span>％</span><div><h2>Grade conversion</h2><p>Set the percentage range for each GWA when 1.00 is highest.</p></div></div><div class="grade-conversion-head"><span>GWA</span><span>Lowest percent</span><i></i><span>Highest percent</span></div><div class="grade-conversion-table">${state.settings.gradeConversion.map((range,index)=>`<div class="grade-conversion-row"><strong>${Number(range.gwa).toFixed(2)}</strong><label><input type="number" min="0" max="100" step="0.01" value="${range.min}" data-grade-min="${index}" aria-label="${Number(range.gwa).toFixed(2)} lowest percent"><span>%</span></label><i>—</i><label><input type="number" min="0" max="100" step="0.01" value="${range.max}" data-grade-max="${index}" aria-label="${Number(range.gwa).toFixed(2)} highest percent"><span>%</span></label></div>`).join('')}</div><div class="grade-conversion-footer"><small>Percentages must stay between 0 and 100.</small><button type="button" class="secondary-button" id="reset-grade-conversion">Reset defaults</button></div></article>` : ''}
       <article class="settings-card"><div class="settings-heading"><span>↻</span><div><h2>Data and synchronization</h2><p>Manage backups and connected data.</p></div></div><div class="status-line"><span><i class="${state.sync}"></i>Supabase</span><strong>${state.sync === 'connected' ? 'Connected' : state.sync === 'error' ? 'Connection error' : state.sync === 'connecting' ? 'Connecting' : 'Not configured'}</strong></div><div class="status-line"><span>Last synchronization</span><strong>${state.lastSync ? new Date(state.lastSync).toLocaleString() : 'Never'}</strong></div><div class="settings-actions"><button class="secondary-button" id="export-csv">Export grades as CSV</button><button class="secondary-button" id="export-backup">Export backup</button><label class="secondary-button file-button">Import backup<input id="import-backup" type="file" accept="application/json"></label><button class="danger-button" id="clear-cache">Clear local cache</button></div></article>
-      <article class="settings-card"><div class="settings-heading"><span>♙</span><div><h2>Privacy and account</h2><p>${state.account?.email ? safe(state.account.email) : state.account?.is_anonymous ? 'Anonymous account' : 'No account information'}</p></div></div><div class="account-form"><input id="account-email" type="email" placeholder="Email address"><input id="account-password" type="password" placeholder="Password"><button class="secondary-button" id="sign-in">Sign in</button><button class="primary" id="link-account">Link anonymous account</button></div><div class="settings-actions"><button class="secondary-button" id="sign-out">Sign out</button><button class="danger-button" id="delete-account">Delete account and data</button></div><details><summary>Privacy information</summary><p>GradeTracker stores preferences on this device. When Supabase is connected, your profile and courses are stored under your authenticated user ID and protected by Row Level Security.</p></details></article>
-      <article class="settings-card"><div class="settings-heading"><span>ⓘ</span><div><h2>About</h2><p>GradeTracker version 1.0.0</p></div></div><div class="about-links"><details><summary>Changelog</summary><p>Version 1.0.0 introduces course tracking, profiles, themes, backups, and Supabase synchronization.</p></details><a href="mailto:feedback@gradetracker.app?subject=GradeTracker%20Feedback">Feedback</a><details><summary>Licences</summary><p>Built with Electron, Capacitor, Vite, and Supabase. Third-party packages retain their respective open-source licences.</p></details></div></article>
+      <article class="settings-card"><div class="settings-heading"><span>♙</span><div><h2>Privacy and account</h2><p>${state.account?.email ? safe(state.account.email) : state.account?.is_anonymous ? 'Anonymous account' : 'No account information'}</p></div></div><div class="account-form"><input id="account-email" type="email" placeholder="Email address"><input id="account-password" type="password" placeholder="Password"><button class="secondary-button" id="sign-in">Sign in</button><button class="primary" id="link-account">Link anonymous account</button></div><div class="settings-actions"><button class="secondary-button" id="sign-out">Sign out</button><button class="danger-button" id="delete-account">Delete account and data</button></div></article>
+      <article class="settings-card about-card"><div class="settings-heading"><span>ⓘ</span><div><h2>About</h2><p>GradeTracker version ${safe(appVersion)}</p></div></div><dialog id="privacy-policy-dialog" aria-labelledby="privacy-policy-title"><div class="dialog-head"><div><h2 id="privacy-policy-title">Privacy Policy</h2></div><button type="button" class="close" id="close-privacy-policy" aria-label="Close privacy policy">×</button></div><p>GradeTracker stores preferences and saved app data on this device. When Supabase is connected, your profile, courses, terms, and grades can be stored under your authenticated user ID and protected by Row Level Security.</p><p>You can export your data from Settings. The Privacy and account section provides a control to delete your account and its associated cloud data.</p></dialog><div class="about-links"><details class="changelog-details"><summary>Changelog</summary>${renderChangelog()}</details><details><summary>Licences</summary><p>Built with Electron, Capacitor, Vite, and Supabase. Third-party packages retain their respective open-source licences.</p></details></div><div class="about-footer-links"><button type="button" class="text-button" id="open-privacy-policy">Privacy Policy</button><a href="mailto:feedback@gradetracker.app?subject=GradeTracker%20Feedback">Feedback</a></div></article>
     </section>`;
   const placeholder = state.active === 'Profile' ? `
     <section class="profile-page">
@@ -273,8 +298,8 @@ function render() {
         </header>
         ${currentPage ? placeholder : `
         <section class="stats">
-          <article><span class="stat-icon coral">↗</span><div><p>Overall average</p><strong>${average}%</strong><small class="positive">↑ 2.4% <em>from last month</em></small></div><div class="ring" style="--progress:${average * 3.6}deg"><span>${letterGrade(average)}</span></div></article>
-          <article><span class="stat-icon purple">◇</span><div><p>Term GPA</p><strong>${(average / 25).toFixed(2)}</strong><small>On a 4.0 scale</small></div></article>
+          <article><span class="stat-icon coral">↗</span><div><p>Current Term GWA</p><strong>${termGwa == null ? '—' : termGwa.toFixed(2)}</strong><small>${gradedCourseCount} of ${currentCourses.length} courses graded</small></div><div class="ring term-gwa-ring" style="--progress:${targetProgress * 3.6}deg" role="img" aria-label="${termGwa == null ? 'No grades yet' : `${termGwa.toFixed(2)} GWA`}; target ${targetGwa.toFixed(2)}" title="Target GWA: ${targetGwa.toFixed(2)}"><span>${termGwa == null ? '—' : termGwa.toFixed(2)}</span></div></article>
+          <article><span class="stat-icon purple">◇</span><div><p>Current Term Units</p><strong>${averageUnits}</strong><small>${currentCourses.length} ${currentCourses.length === 1 ? 'course' : 'courses'} enrolled</small></div></article>
           <article><span class="stat-icon teal">✓</span><div><p>Credited units</p><strong>${credits}<small> / ${requiredUnits}</small></strong><small>${Math.max(0, requiredUnits - credits)} units remaining</small></div></article>
         </section>
         <section class="section-head"><div><h2>Your courses</h2><p>${currentCourses.length} course${currentCourses.length === 1 ? '' : 's'} in ${safe(currentTerm?.name || 'the current term')}</p></div><button class="text-button">View all →</button></section>
@@ -293,6 +318,7 @@ function render() {
     <dialog id="course-dialog"><form method="dialog" id="course-form"><input type="hidden" name="id"><div class="dialog-head"><div><h2 id="course-dialog-title">Add a course</h2><p>Keep course information and term assignment together.</p></div><button type="button" class="close" data-close-course aria-label="Close">×</button></div><div class="form-row"><label>Course code<input name="code" required placeholder="e.g. BIO 101" maxlength="12"></label><label>Course type<select name="courseType"><option>Core</option><option>Specialization</option><option>Elective</option></select></label></div><label>Course title<input name="name" required placeholder="e.g. General Biology" maxlength="80"></label><label>Instructor<input name="instructor" placeholder="Instructor name" maxlength="80"></label><div class="form-row"><label>Current grade<input name="grade" type="number" min="0" max="100" value="85" required></label><label>Units<input name="credits" type="number" min="1" max="30" value="${state.settings.defaultUnits}" required></label></div><label>Assign to term<select name="termId"><option value="">Unassigned</option>${state.terms.filter(term => term.format === state.settings.termFormat).map(term => `<option value="${term.id}">${safe(term.academicYear)} · ${safe(term.name)}</option>`).join('')}</select></label><div class="course-relation-grid"><fieldset><legend>Prerequisites</legend><p>Courses that must be taken first</p><div class="course-relation-list">${state.courses.length ? state.courses.map(course => `<label data-related-course="${course.id}"><input type="checkbox" name="prerequisiteId" value="${course.id}"><span><strong>${safe(course.code)}</strong><small>${safe(course.name)}</small></span></label>`).join('') : '<small>No existing courses yet.</small>'}</div></fieldset><fieldset><legend>Co-requisites</legend><p>Courses taken at the same time</p><div class="course-relation-list">${state.courses.length ? state.courses.map(course => `<label data-related-course="${course.id}"><input type="checkbox" name="corequisiteId" value="${course.id}"><span><strong>${safe(course.code)}</strong><small>${safe(course.name)}</small></span></label>`).join('') : '<small>No existing courses yet.</small>'}</div></fieldset></div><label class="course-dialog-check"><input name="considered" type="checkbox" checked><span>Include units in Term GWA calculation</span></label><div class="course-dialog-footer"><button type="button" class="secondary-button" data-close-course>Cancel</button><button type="submit" value="save" class="primary" id="save-course">Add course</button></div></form></dialog>`;
 
   bindEvents();
+  normalizeIcons(document.querySelector('#app'));
 }
 
 function bindEvents() {
@@ -310,9 +336,56 @@ function bindEvents() {
     rerender: render
   });
   if(state.active==='Grades')bindGradesPage(state,{persist:async course=>{localStorage.setItem('grade-tracker-courses',JSON.stringify(state.courses));try{if(isSupabaseConfigured){await updateCourse(course);state.sync='connected';markSynced();}}catch(error){state.sync='error';state.notice=error.message;}},rerender:render});
-  const filterCourses = () => { const query=(document.querySelector('#course-search')?.value||'').trim().toLowerCase(),type=document.querySelector('#course-type-filter')?.value||'all';let visible=0;document.querySelectorAll('[data-course-item]').forEach(item=>{const show=(!query||item.dataset.search.includes(query))&&(type==='all'||item.dataset.type===type);item.hidden=!show;if(show)visible+=1;});const empty=document.querySelector('#course-no-results');if(empty)empty.hidden=visible!==0; };
+  const courseTypeFilter = document.querySelector('#course-type-filter');
+  if (courseTypeFilter) {
+    const termFilter = document.createElement('select');
+    termFilter.id = 'course-term-filter';
+    termFilter.setAttribute('aria-label', 'Filter courses by term');
+    termFilter.add(new Option('All terms', 'all'));
+    termFilter.add(new Option('Unassigned', 'unassigned'));
+    const yearGroups = new Map();
+    getVisibleTerms(state).forEach(term => {
+      if (!yearGroups.has(term.academicYear)) {
+        const group = document.createElement('optgroup');
+        group.label = `Year ${Number(term.yearIndex) + 1} · ${term.academicYear}`;
+        yearGroups.set(term.academicYear, group);
+        termFilter.append(group);
+      }
+      yearGroups.get(term.academicYear).append(new Option(term.name, term.id));
+    });
+    courseTypeFilter.after(termFilter);
+    const filters = state.courseFilters || { query: '', type: 'all', term: 'all' };
+    document.querySelector('#course-search').value = filters.query;
+    courseTypeFilter.value = filters.type;
+    termFilter.value = [...termFilter.options].some(option => option.value === filters.term) ? filters.term : 'all';
+    styleTermDropdown(termFilter);
+    styleTermDropdown(courseTypeFilter);
+  }
+  const filterCourses = () => {
+    const search = document.querySelector('#course-search');
+    if (!search) return;
+    const type = courseTypeFilter.value, termId = document.querySelector('#course-term-filter').value;
+    const query = search.value.trim().toLowerCase();
+    state.courseFilters = { query: search.value, type, term: termId };
+    const selectedTermIds = new Set((state.terms.find(term => term.id === termId)?.courseIds || []).map(String));
+    const assignedIds = new Set(state.terms.flatMap(term => (term.courseIds || []).map(String)));
+    let visible = 0;
+    document.querySelectorAll('[data-course-item]').forEach(item => {
+      const id = item.querySelector('[data-course-open]').dataset.courseOpen;
+      const matchesTerm = termId === 'all' || (termId === 'unassigned' ? !assignedIds.has(id) : selectedTermIds.has(id));
+      const show = (!query || item.dataset.search.includes(query)) && (type === 'all' || item.dataset.type === type) && matchesTerm;
+      item.hidden = !show;
+      if (show) visible++;
+    });
+    const empty = document.querySelector('#course-no-results');
+    if (empty) { empty.hidden = visible !== 0; empty.textContent = 'No courses match your filters.'; }
+  };
   document.querySelector('#course-search')?.addEventListener('input',filterCourses);
   document.querySelector('#course-type-filter')?.addEventListener('change',filterCourses);
+  document.querySelector('#course-term-filter')?.addEventListener('change',filterCourses);
+  filterCourses();
+  document.querySelector('#open-privacy-policy')?.addEventListener('click', () => document.querySelector('#privacy-policy-dialog').showModal());
+  document.querySelector('#close-privacy-policy')?.addEventListener('click', () => document.querySelector('#privacy-policy-dialog').close());
   const saveSetting = (key, value) => {
     state.settings[key] = value;
     localStorage.setItem('grade-tracker-settings', JSON.stringify(state.settings));
@@ -322,7 +395,32 @@ function bindEvents() {
   document.querySelector('#setting-accent')?.addEventListener('input', event => { saveSetting('accent', event.target.value); event.target.nextElementSibling.textContent = event.target.value; });
   document.querySelector('#setting-density')?.addEventListener('change', event => { saveSetting('density', event.target.value); render(); });
   document.querySelector('#setting-sidebar')?.addEventListener('change', event => { saveSetting('sidebarOpen', event.target.checked); state.sidebarCollapsed = !event.target.checked; localStorage.setItem('grade-tracker-sidebar', state.sidebarCollapsed ? 'collapsed' : 'expanded'); render(); });
-  document.querySelector('#setting-start')?.addEventListener('change', event => { if (event.target.value) saveSetting('academicStartDate', event.target.value); render(); });
+  document.querySelector('#setting-start')?.addEventListener('change', async event => {
+    const nextStart = event.target.value;
+    if (!nextStart || nextStart === state.settings.academicStartDate) return;
+    adjustAcademicStart(state, nextStart);
+    saveSetting('academicStartDate', nextStart);
+    render();
+    if (isSupabaseConfigured) {
+      try {
+        await Promise.all(state.terms.map(upsertTerm));
+        state.sync = 'connected';
+        markSynced();
+      } catch (error) {
+        state.sync = 'error';
+        state.notice = `Dates saved locally; synchronization failed: ${error.message}`;
+      }
+      render();
+    }
+  });
+  document.querySelectorAll('.settings-page select').forEach(select => {
+    select.setAttribute('aria-label', select.closest('label')?.firstChild.textContent.trim() || 'Choose setting');
+    styleTermDropdown(select);
+  });
+  const academicStartInput = document.querySelector('#setting-start');
+  if (academicStartInput) styleDatePicker(academicStartInput);
+  const accentInput = document.querySelector('#setting-accent');
+  if (accentInput) styleColorPicker(accentInput);
   document.querySelector('#setting-required-units')?.addEventListener('change', event => { saveSetting('requiredUnits', Math.max(1, Math.min(999, Number(event.target.value) || 180))); render(); });
   document.querySelector('#setting-term')?.addEventListener('change', event => { saveSetting('termFormat', event.target.value); state.selectedTermId = null; render(); });
   document.querySelectorAll('[data-grade-min],[data-grade-max]').forEach(input=>input.addEventListener('change',event=>{const isMin=event.target.hasAttribute('data-grade-min'),index=Number(event.target.dataset.gradeMin??event.target.dataset.gradeMax),range={...state.settings.gradeConversion[index]},value=Math.max(0,Math.min(100,Number(event.target.value)||0));if(isMin){range.min=value;if(range.max<value)range.max=value;}else{range.max=value;if(range.min>value)range.min=value;}const conversion=state.settings.gradeConversion.map((item,itemIndex)=>itemIndex===index?range:item);saveSetting('gradeConversion',conversion);render();}));
@@ -338,10 +436,23 @@ function bindEvents() {
     try {
       const backup = JSON.parse(await file.text());
       if (!Array.isArray(backup.courses) || !backup.profile || !backup.settings) throw new Error('Invalid backup format');
-      state.courses = backup.courses; state.terms = Array.isArray(backup.terms) ? backup.terms : createDefaultTerms(); state.profile = { ...defaultProfile, ...backup.profile }; state.settings = { ...defaultSettings, ...backup.settings };
+      if (backup.courses.some(course => !course || course.id == null || typeof course.code !== 'string')) throw new Error('Invalid course records in backup');
+      const hasData = state.courses.length > 0 || state.terms.some(term => term.courseIds?.length || term.startDate || term.endDate || term.notes) || state.profile.full_name !== defaultProfile.full_name;
+      const mode = hasData ? await chooseBackupImportMode() : 'replace';
+      if (mode === 'cancel') return;
+      preserveLocalWorkspace(state);
+      if (mode === 'add') {
+        const merged = mergeBackupData(state, backup);
+        state.courses = merged.courses; state.terms = merged.terms;
+      } else {
+        state.courses = backup.courses; state.terms = Array.isArray(backup.terms) ? backup.terms : createDefaultTerms(); state.profile = { ...defaultProfile, ...backup.profile }; state.settings = { ...defaultSettings, ...backup.settings };
+        localStorage.removeItem('grade-tracker-deleted-terms');
+      }
+      state.selectedCourseId = null; state.selectedTermId = null;
       localStorage.setItem('grade-tracker-courses', JSON.stringify(state.courses)); localStorage.setItem('grade-tracker-terms', JSON.stringify(state.terms)); localStorage.setItem('grade-tracker-profile', JSON.stringify(state.profile)); localStorage.setItem('grade-tracker-settings', JSON.stringify(state.settings));
-      state.notice = 'Backup imported successfully.'; render();
+      state.notice = mode === 'add' ? 'New backup data added. Existing records were kept.' : 'Local data replaced with the backup.'; render();
     } catch (error) { state.notice = `Import failed: ${error.message}`; render(); }
+    finally { event.target.value = ''; }
   });
   document.querySelector('#clear-cache')?.addEventListener('click', () => {
     if (!window.confirm('Clear locally cached courses, profile, and settings? Cloud data will not be deleted.')) return;
@@ -349,11 +460,14 @@ function bindEvents() {
     state.courses = [...defaultCourses]; state.terms = createDefaultTerms(); state.profile = { ...defaultProfile }; state.settings = { ...defaultSettings }; state.sidebarCollapsed = false; state.lastSync = ''; state.notice = 'Local cache cleared.'; render();
   });
   document.querySelector('#sign-in')?.addEventListener('click', async () => {
+    preserveLocalWorkspace(state);
     const email = document.querySelector('#account-email').value.trim(); const password = document.querySelector('#account-password').value;
     try {
       state.account = await signInWithPassword(email, password);
       const [courses, profile] = await Promise.all([loadCourses(), loadProfile()]);
       state.courses = courses?.length ? courses : [];
+      localStorage.setItem('grade-tracker-workspace-user', state.account.id);
+      localStorage.setItem('grade-tracker-courses', JSON.stringify(state.courses));
       if (profile) state.profile = profile;
       state.notice = 'Signed in successfully.'; state.sync = 'connected'; markSynced(); render();
     } catch (error) { state.notice = error.message; render(); }
@@ -454,10 +568,10 @@ function bindEvents() {
   dialog.addEventListener('close', async () => {
     if (dialog.returnValue !== 'save') return;
     const data = new FormData(courseForm);
-    const colors = ['#ff6b51', '#7967e8', '#2fa8a0', '#e0a228', '#3f8efc'];
+
     const existing=state.courses.find(course=>String(course.id)===data.get('id'));
     const considered=data.get('considered')==='on',selectedGrade=data.get('finalGrade');
-    const draft = { ...(existing||{}), id:existing?.id||Date.now(), code: data.get('code').trim().toUpperCase(), name: data.get('name').trim(), instructor:data.get('instructor').trim(), finalGrade:selectedGrade===''?null:considered?Number(selectedGrade):selectedGrade==='P'?3:state.profile.scale_type==='5-highest'?1:5, gradeResult:considered?'':selectedGrade, credits: Number(data.get('credits')), considered, courseType:data.get('courseType'), prerequisiteIds:data.getAll('prerequisiteId'), corequisiteIds:data.getAll('corequisiteId'), assessments:existing?.assessments||0, color:existing?.color||colors[state.courses.length % colors.length] };
+    const draft = { ...(existing||{}), id:existing?.id||Date.now(), code: data.get('code').trim().toUpperCase(), name: data.get('name').trim(), instructor:data.get('instructor').trim(), finalGrade:selectedGrade===''?null:considered?Number(selectedGrade):selectedGrade==='P'?3:state.profile.scale_type==='5-highest'?1:5, gradeResult:considered?'':selectedGrade, credits: Number(data.get('credits')), considered, courseType:data.get('courseType'), prerequisiteIds:data.getAll('prerequisiteId'), corequisiteIds:data.getAll('corequisiteId'), assessments:existing?.assessments||0, color:courseTypeColor(data.get('courseType')) };
     const gradebook=ensureGradebook(draft);if(!existing||finalGradeTouched){gradebook.override=selectedGrade===''?null:considered?Number(selectedGrade):selectedGrade;if(gradebook.override==null){const automatic=calculateCourseGrade(draft,state.settings,state.profile).automaticResult;if(considered)draft.finalGrade=automatic==null?null:Number(automatic);else{draft.gradeResult=automatic||'';draft.finalGrade=automatic==='P'?3:automatic==='F'?(state.profile.scale_type==='5-highest'?1:5):null;}}}
     try {
       const saved = existing ? await updateCourse(draft) : await createCourse(draft);
@@ -481,26 +595,40 @@ function bindEvents() {
 }
 
 async function initialise() {
+  const hadSavedCourses = localStorage.getItem('grade-tracker-courses') !== null;
+  const localOwner = localStorage.getItem('grade-tracker-workspace-user');
+  if (hadSavedCourses) preserveLocalWorkspace(state);
   render();
-  if (!isSupabaseConfigured) return;
+  if (!isSupabaseConfigured) {
+    try { await importCoreCourses(state, { createCourse, updateCourse, ensureGradebook }); }
+    catch (error) { state.notice = error.message; }
+    render();
+    return;
+  }
 
   try {
     const [courses, profile, account, terms] = await Promise.all([loadCourses(), loadProfile(), getAccount(), loadTerms()]);
-    if (courses?.length) {
-      state.courses = courses;
-      localStorage.setItem('grade-tracker-courses', JSON.stringify(courses));
-    }
+    const sameWorkspace = !localOwner || localOwner === account?.id;
+    if (hadSavedCourses && sameWorkspace) state.courses = mergeCourseLists(state.courses, courses);
+    else if (courses?.length || !sameWorkspace) state.courses = courses || [];
+    localStorage.setItem('grade-tracker-courses', JSON.stringify(state.courses));
+    if (account?.id) localStorage.setItem('grade-tracker-workspace-user', account.id);
     if (profile) {
       state.profile = profile;
       localStorage.setItem('grade-tracker-profile', JSON.stringify(profile));
     }
     state.account = account;
-    if (terms?.length) { state.terms = terms; localStorage.setItem('grade-tracker-terms', JSON.stringify(terms)); }
+    if (terms?.length) {
+      state.terms = sameWorkspace ? mergeCourseLists(state.terms, terms) : terms;
+      localStorage.setItem('grade-tracker-terms', JSON.stringify(state.terms));
+    }
+    await importCoreCourses(state, { createCourse, updateCourse, ensureGradebook });
     state.sync = 'connected';
     markSynced();
   } catch (error) {
     console.error('Supabase connection failed:', error);
     state.sync = 'error';
+    state.notice = `Supabase connection failed: ${error.message || 'Unknown error'}`;
   }
   render();
 }

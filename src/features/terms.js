@@ -7,12 +7,13 @@ export const createDefaultTerms = () => [
 ];
 
 const dateOnly = value => new Date(`${value}T00:00:00`);
-const statusFor = term => {
-  if (term.completed) return 'completed';
+export const statusFor = (term, now = new Date()) => {
   if (!term.startDate || !term.endDate) return 'setup';
-  const today = new Date(); today.setHours(0, 0, 0, 0);
-  if (today < dateOnly(term.startDate)) return 'upcoming';
-  if (today > dateOnly(term.endDate)) return 'completed';
+  const start = dateOnly(term.startDate), end = dateOnly(term.endDate);
+  if (!Number.isFinite(start.getTime()) || !Number.isFinite(end.getTime()) || end < start) return 'setup';
+  const today = new Date(now); today.setHours(0, 0, 0, 0);
+  if (today < start) return 'upcoming';
+  if (today > end) return 'completed';
   return 'current';
 };
 const progressFor = term => {
@@ -29,6 +30,30 @@ const academicYearFor = (startYear, index) => `${startYear + index}–${startYea
 const termOrder = term => Number(term.yearIndex || 0) * 10 + Number(term.number || 0);
 const termDeletionKey = term => `${term.format}|${term.academicYear}|${term.number}`;
 let activeGradeConversion = [];
+
+export function adjustAcademicStart(state, nextStart) {
+  const previousStart = state.settings.academicStartDate;
+  if (!previousStart || previousStart === nextStart) return;
+  const dayOffset = Date.parse(`${nextStart}T00:00:00Z`) - Date.parse(`${previousStart}T00:00:00Z`);
+  if (!Number.isFinite(dayOffset)) return;
+  const yearOffset = Number(nextStart.slice(0, 4)) - Number(previousStart.slice(0, 4));
+  const shiftYear = value => {
+    const match = /^(\d{4})[–-](\d{4})$/.exec(value || '');
+    return match ? `${Number(match[1]) + yearOffset}–${Number(match[2]) + yearOffset}` : value;
+  };
+  const shiftDate = value => value ? new Date(Date.parse(`${value}T00:00:00Z`) + dayOffset).toISOString().slice(0, 10) : '';
+  for (const term of state.terms) {
+    term.academicYear = shiftYear(term.academicYear);
+    term.startDate = shiftDate(term.startDate);
+    term.endDate = shiftDate(term.endDate);
+  }
+  const deleted = JSON.parse(localStorage.getItem('grade-tracker-deleted-terms') || '[]');
+  localStorage.setItem('grade-tracker-deleted-terms', JSON.stringify(deleted.map(key => {
+    const [format, year, number] = key.split('|');
+    return `${format}|${shiftYear(year)}|${number}`;
+  })));
+  localStorage.setItem('grade-tracker-terms', JSON.stringify(state.terms));
+}
 
 export function ensureAutomaticTerms(state) {
   const format = state.settings.termFormat || 'quarter';
@@ -72,13 +97,50 @@ const statsFor = (term, courses, scaleType, conversion=[]) => {
   return { assigned, totalUnits, gwa: gradedUnits ? weighted / gradedUnits : null, passed: assigned.filter(course => hasResult(course) && passed(course)).length, failed: assigned.filter(course => hasResult(course) && !passed(course)).length, incomplete: assigned.filter(course => !hasResult(course)).length };
 };
 
+function renderHistoryLineChart(historyStats, scaleType) {
+  if (!historyStats.some(item => item.gwa != null)) return '<div class="history-line-empty">No completed term grades to plot yet.</div>';
+  const width = Math.max(760, historyStats.length * 105 + 110);
+  const left = 50, right = width - 55, top = 42, bottom = 230;
+  const x = index => historyStats.length === 1 ? (left + right) / 2 : left + index * (right - left) / (historyStats.length - 1);
+  // Better grades appear higher for either grading scale.
+  const y = gwa => top + (scaleType === '5-highest' ? 5 - gwa : gwa - 1) / 4 * (bottom - top);
+  const segments = [];
+  let segment = [];
+  historyStats.forEach((item, index) => {
+    if (item.gwa == null) {
+      if (segment.length) segments.push(segment);
+      segment = [];
+    } else segment.push([x(index), y(item.gwa)]);
+  });
+  if (segment.length) segments.push(segment);
+  const curve = points => points.map(([px, py], index) => {
+    if (!index) return `M ${px} ${py}`;
+    const [previousX, previousY] = points[index - 1], middle = (previousX + px) / 2;
+    return `C ${middle} ${previousY}, ${middle} ${py}, ${px} ${py}`;
+  }).join(' ');
+  const latest = historyStats.findLastIndex(item => item.gwa != null);
+  return `<div class="history-line-scroll"><svg class="history-line-chart" viewBox="0 0 ${width} 290" style="min-width:${Math.max(500, historyStats.length * 85)}px" role="img" aria-label="GWA across completed terms. Better grades appear higher; ungraded terms leave gaps.">
+    <defs><linearGradient id="history-area-fill" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stop-color="var(--app-accent)" stop-opacity=".14"/><stop offset="100%" stop-color="var(--app-accent)" stop-opacity="0"/></linearGradient></defs>
+    <text class="history-axis-title" x="${left}" y="16">GWA</text>
+    ${[1, 3, 5].map(grade => `<line class="history-gridline" x1="${left}" x2="${right}" y1="${y(grade)}" y2="${y(grade)}"/><text class="history-axis-label" x="${left - 18}" y="${y(grade) + 4}" text-anchor="end">${grade.toFixed(1)}</text>`).join('')}
+    ${segments.map(points => `${points.length > 1 ? `<path fill="url(#history-area-fill)" d="${curve(points)} L ${points.at(-1)[0]} ${bottom} L ${points[0][0]} ${bottom} Z"/>` : ''}<path class="history-line" d="${curve(points)}"/>`).join('')}
+    ${historyStats.map((item, index) => `<g class="history-datum">${item.gwa == null ? '' : `${index === latest ? `<circle class="history-point-halo" cx="${x(index)}" cy="${y(item.gwa)}" r="12"/>` : ''}<circle class="history-point" cx="${x(index)}" cy="${y(item.gwa)}" r="${index === latest ? 5 : 3.5}"><title>${esc(item.term.academicYear)} · ${esc(item.term.name)}: ${item.gwa.toFixed(2)} GWA</title></circle><text class="history-value ${index === latest ? 'latest' : ''}" x="${x(index)}" y="${y(item.gwa) - 20}" text-anchor="middle">${item.gwa.toFixed(2)}</text>`}<text class="history-axis-label history-term-label" x="${x(index)}" y="258" text-anchor="middle">${esc(item.term.name.replace('Quarter', 'Qtr').replace('Semester', 'Sem'))}</text><text class="history-axis-label history-year-label" x="${x(index)}" y="276" text-anchor="middle">${esc(item.term.academicYear)}</text></g>`).join('')}
+  </svg></div>`;
+}
+
+export function getVisibleTerms(state) {
+  const startYear = Number(state.settings.academicStartDate?.slice(0, 4)) || new Date().getFullYear();
+  const years = new Set(Array.from({ length: 4 }, (_, index) => academicYearFor(startYear, index)));
+  return state.terms.filter(term => term.format === state.settings.termFormat && years.has(term.academicYear)).sort((a, b) => termOrder(a) - termOrder(b));
+}
+
 export function renderTermsPage(state) {
   activeGradeConversion = state.settings.gradeConversion || [];
   ensureAutomaticTerms(state);
   const startYear = Number(state.settings.academicStartDate?.slice(0, 4)) || new Date().getFullYear();
-  const activeAcademicYears = new Set(Array.from({ length: 4 }, (_, index) => academicYearFor(startYear, index)));
-  const visible = state.terms.filter(term => term.format === state.settings.termFormat && activeAcademicYears.has(term.academicYear)).sort((a, b) => termOrder(a) - termOrder(b));
-  const current = visible.find(term => statusFor(term) === 'current') || visible.find(term => statusFor(term) === 'upcoming') || visible.find(term => statusFor(term) === 'setup') || visible.at(-1);
+  const visible = getVisibleTerms(state);
+  const dated = [...visible].sort((a, b) => (a.startDate || '9999').localeCompare(b.startDate || '9999'));
+  const current = dated.find(term => statusFor(term) === 'current') || dated.find(term => statusFor(term) === 'upcoming') || visible.find(term => statusFor(term) === 'setup') || dated.filter(term => statusFor(term) === 'completed').at(-1);
   const selected = visible.find(term => term.id === state.selectedTermId) || current;
   if (selected && !state.selectedTermId) state.selectedTermId = selected.id;
   const selectedStats = selected ? statsFor(selected, state.courses, state.profile.scale_type, state.settings.gradeConversion) : null;
@@ -87,7 +149,6 @@ export function renderTermsPage(state) {
   const validGwas = historyStats.filter(item => item.gwa != null);
   const best = validGwas.sort((a, b) => state.profile.scale_type === '5-highest' ? b.gwa - a.gwa : a.gwa - b.gwa)[0];
   const previous = visible.filter(term => selected && termOrder(term) < termOrder(selected)).at(-1);
-  const previousStats = previous ? statsFor(previous, state.courses, state.profile.scale_type, state.settings.gradeConversion) : null;
   const groupedTerms = Array.from({ length: 4 }, (_, index) => ({ index, terms: visible.filter(term => Number(term.yearIndex) === index) }));
   const unitCap = formatUnitCaps[state.settings.termFormat] || 18;
   const assignmentOptions = selected ? state.courses.map(course => {
@@ -105,8 +166,8 @@ export function renderTermsPage(state) {
       ${groupedTerms.map(group => `<section class="term-year-group"><div class="term-year-label"><strong>${yearLabel(group.index)}</strong><span>${esc(academicYearFor(Number(state.settings.academicStartDate?.slice(0, 4)) || new Date().getFullYear(), group.index))}</span></div>${group.terms.map(term => { const stat = statsFor(term, state.courses, state.profile.scale_type); const status = statusFor(term); return `<article class="term-row ${selected?.id === term.id ? 'selected' : ''}"><button class="term-open" data-term-open="${term.id}"><span class="term-status ${status}">${status === 'setup' ? 'needs dates' : status}</span><strong>${esc(term.name)}</strong><small>${status === 'setup' ? 'Set term start and end dates' : dateRange(term)}</small></button><div class="term-metrics"><span><b>${stat.assigned.length}</b> courses</span><span><b>${stat.totalUnits}</b> units</span><span><b>${stat.gwa?.toFixed(2) || '—'}</b> GWA</span></div><div class="term-actions"><button title="Set dates and details" data-edit-term="${term.id}" aria-label="Edit ${esc(term.name)}">✎</button></div></article>`; }).join('')}</section>`).join('')}
     </div></section>
     ${selected ? `<aside class="term-detail"><div class="detail-head"><div><span>SELECTED TERM</span><h2>${esc(selected.name)}</h2><p>${esc(selected.academicYear)}</p></div><button class="secondary-button" data-edit-term="${selected.id}">Edit</button></div><div class="stat-grid"><div><span>Current GWA</span><strong>${selectedStats.gwa?.toFixed(2) || '—'}</strong></div><div><span>Goal GWA</span><strong>${Number(state.profile.goal_gwa).toFixed(2)}</strong></div><div><span>Units</span><strong>${selectedStats.totalUnits}</strong></div><div><span>Courses</span><strong>${selectedStats.assigned.length}</strong></div></div><div class="result-counts"><span class="pass">${selectedStats.passed} Passed</span><span class="incomplete">${selectedStats.incomplete} Incomplete</span><span class="fail">${selectedStats.failed} Failed</span></div><div class="assigned-head"><h3>Assigned courses</h3><button class="text-button" id="assign-courses">Manage</button></div><div class="assigned-list">${selectedStats.assigned.length ? selectedStats.assigned.map(course => `<div><span><strong>${esc(course.code)}</strong><small>${esc(course.name)}</small></span><select data-move-course="${course.id}"><option value="">Move to…</option>${visible.filter(term => term.id !== selected.id).map(term => `<option value="${term.id}">${esc(term.name)}</option>`).join('')}</select></div>`).join('') : '<p>No courses assigned.</p>'}</div><div class="detail-actions"><button class="secondary-button" id="copy-previous" ${!previous ? 'disabled' : ''}>Copy previous courses</button><button class="primary" id="complete-term" ${selected.completed ? 'disabled' : ''}>${selected.completed ? 'Grades locked' : 'Complete & lock'}</button><button class="secondary-button" id="carry-incomplete" ${selectedStats.incomplete ? '' : 'disabled'}>Carry incomplete forward</button></div>${selected.notes ? `<p class="term-notes">${esc(selected.notes)}</p>` : ''}</aside>` : ''}</div>
-    <section class="history-card"><div class="section-head"><div><h2>History and comparison</h2><p>Performance across completed terms</p></div>${best ? `<span class="best-term">Best: ${esc(best.term.name)} · ${best.gwa.toFixed(2)}</span>` : ''}</div><div class="history-grid"><div class="trend-chart">${historyStats.length ? historyStats.map(item => `<div><span style="height:${item.gwa == null ? 6 : Math.max(12, (6 - item.gwa) / 5 * 100)}%"></span><small>${esc(item.term.name.replace(' Quarter','Q'))}</small></div>`).join('') : '<p>Complete a term to see trends.</p>'}</div><div class="comparison"><span>Compared with previous term</span><strong>${selectedStats?.gwa != null && previousStats?.gwa != null ? `${selectedStats.gwa <= previousStats.gwa ? '↑' : '↓'} ${Math.abs(selectedStats.gwa - previousStats.gwa).toFixed(2)} GWA` : 'Not enough data'}</strong><small>${historyStats.reduce((sum,item) => sum + item.totalUnits, 0)} units completed over time</small></div></div></section>
-    <dialog id="term-dialog"><form method="dialog" id="term-form"><input type="hidden" name="id"><div class="dialog-head"><span class="term-dialog-icon">▦</span><div><span class="dialog-eyebrow">ACADEMIC PERIOD</span><h2>Term details</h2><p id="term-dialog-context">Set the dates and notes for this term.</p></div><button type="button" data-close-term class="close" aria-label="Close term dialog">×</button></div><fieldset><legend><span>01</span> Schedule</legend><div class="form-row"><label>Start date<input name="startDate" type="date" required></label><label>End date<input name="endDate" type="date" required></label></div></fieldset><fieldset><legend><span>02</span> Notes</legend><label>Notes<textarea name="notes" rows="3" placeholder="Add reminders or notes for this term…"></textarea></label></fieldset><div class="term-dialog-footer"><button type="button" id="delete-term-dialog" class="delete-term-dialog" title="Delete term"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>Delete term</span></button><span class="term-dialog-footer-spacer"></span><button type="button" data-close-term class="secondary-button">Cancel</button><button type="submit" value="save" class="primary">Save term <span>→</span></button></div></form></dialog>
+    <section class="history-card"><div class="section-head"><div><h2>Grade history</h2><p>Your performance across completed terms</p></div>${best ? `<span class="best-term">Best GWA <strong>${best.gwa.toFixed(2)}</strong></span>` : ''}</div>${renderHistoryLineChart(historyStats, state.profile.scale_type)}</section>
+    <dialog id="term-dialog"><form method="dialog" id="term-form"><input type="hidden" name="id"><div class="dialog-head"><span class="term-dialog-icon calendar-heading-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="5" width="18" height="16" rx="3"/><path d="M16 3v4M8 3v4M3 11h18M8 15h2m4 0h2M8 18h2"/></svg></span><div><span class="dialog-eyebrow">ACADEMIC PERIOD</span><h2>Term details</h2><p id="term-dialog-context">Set the start and end dates for this term.</p></div><button type="button" data-close-term class="close" aria-label="Close term dialog">×</button></div><fieldset><legend><span>01</span> Schedule</legend><div class="form-row"><label>Start date<input name="startDate" type="date" required></label><label>End date<input name="endDate" type="date" required></label></div></fieldset><div class="term-dialog-footer"><button type="button" id="delete-term-dialog" class="delete-term-dialog" title="Delete term"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 13H7L6 7m4 4v5m4-5v5"/></svg><span>Delete term</span></button><span class="term-dialog-footer-spacer"></span><button type="button" data-close-term class="secondary-button">Cancel</button><button type="submit" value="save" class="primary">Save term <span>→</span></button></div></form></dialog>
     <dialog id="assignment-dialog"><form method="dialog" id="assignment-form"><div class="dialog-head"><div><h2>Manage courses</h2><p>Prerequisites must be passed in an earlier completed term. Co-requisites must be selected together.</p></div><button type="button" data-close-assignment class="close" aria-label="Close course manager">×</button></div><div class="assignment-unit-limit"><span>Selected units</span><strong id="assignment-unit-count">0 / ${unitCap}</strong></div><div class="course-checks">${assignmentOptions}</div><p class="assignment-error" id="assignment-error" hidden></p><div class="assignment-footer"><button type="button" data-close-assignment class="secondary-button">Cancel</button><button type="submit" value="save" class="primary" id="save-assignments">Save assignments</button></div></form></dialog>
   </section>`;
 }
@@ -116,7 +177,7 @@ export function bindTermsPage(state, { persist, remove, rerender }) {
   const termForm = document.querySelector('#term-form');
   document.querySelectorAll('[data-close-term]').forEach(button => button.addEventListener('click', () => termDialog.close('cancel')));
   document.querySelectorAll('[data-edit-term]').forEach(button => button.addEventListener('click', () => { const term = state.terms.find(item => item.id === button.dataset.editTerm); termForm.reset(); Object.entries(term).forEach(([key,value]) => { if (termForm.elements[key] && !Array.isArray(value)) termForm.elements[key].value = value; }); document.querySelector('#term-dialog-context').textContent = `${yearLabel(Number(term.yearIndex || 0))} · ${term.name} · ${term.academicYear}`; termDialog.showModal(); }));
-  termDialog?.addEventListener('close', async () => { if (termDialog.returnValue !== 'save') return; const data = new FormData(termForm); const existing = state.terms.find(term => term.id === data.get('id')); if (!existing) return; const startDate=data.get('startDate'), endDate=data.get('endDate'); if (endDate < startDate) return window.alert('End date must be after the start date.'); Object.assign(existing, { startDate, endDate, targetGwa:Number(state.profile.goal_gwa), notes:data.get('notes').trim() }); state.selectedTermId = existing.id; await persist(existing); rerender(); });
+  termDialog?.addEventListener('close', async () => { if (termDialog.returnValue !== 'save') return; const data = new FormData(termForm); const existing = state.terms.find(term => term.id === data.get('id')); if (!existing) return; const startDate=data.get('startDate'), endDate=data.get('endDate'); if (endDate < startDate) return window.alert('End date must be after the start date.'); Object.assign(existing, { startDate, endDate, targetGwa:Number(state.profile.goal_gwa) }); state.selectedTermId = existing.id; await persist(existing); rerender(); });
   document.querySelectorAll('[data-term-open]').forEach(button => button.addEventListener('click', () => { state.selectedTermId = button.dataset.termOpen; rerender(); }));
   document.querySelector('#delete-term-dialog')?.addEventListener('click', async () => { const term=state.terms.find(item=>item.id===termForm.elements.id.value); if(!term || !window.confirm(`Delete ${term.name} from ${yearLabel(Number(term.yearIndex || 0))}? Courses will not be deleted.`))return; termDialog.close('delete'); state.terms=state.terms.filter(item=>item.id!==term.id); const deletedIds=new Set(JSON.parse(localStorage.getItem('grade-tracker-deleted-terms')||'[]')); deletedIds.add(termDeletionKey(term)); localStorage.setItem('grade-tracker-deleted-terms',JSON.stringify([...deletedIds])); if(state.selectedTermId===term.id)state.selectedTermId=null; await remove(term.id); rerender(); });
   document.querySelector('#copy-previous')?.remove();

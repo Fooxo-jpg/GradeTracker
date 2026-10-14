@@ -11,12 +11,26 @@ A responsive starter app with one web interface packaged for Windows (Electron) 
 - Windows NSIS installer configuration (`.exe`)
 - Android Capacitor configuration (`.apk`)
 
+## Release notes
+
+Write version updates in `CHANGELOG.md` using `##` for versions, `###` for
+sections, and `-` for bullet points. Keep work in progress under `## Unreleased`.
+For a release, rename that heading to the version and date, for example
+`## 1.0.1 — 2026-10-13`, and update the `version` in `package.json`
+(or run `npm version 1.0.1 --no-git-tag-version` to update the lockfile too).
+The About version and Changelog are loaded from these files automatically.
+Restart development or rebuild packaged apps to include the updated notes.
+
 ## Run locally
 
 ```powershell
 pnpm install
 pnpm dev
 ```
+
+For the Electron desktop app during development, run `npm run desktop:dev`.
+This starts Vite and Electron together. To launch the built app locally, run
+`npm run build` followed by `npx electron .`.
 
 ## Connect Supabase
 
